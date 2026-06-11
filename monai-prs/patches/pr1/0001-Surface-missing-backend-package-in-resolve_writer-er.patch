@@ -1,0 +1,125 @@
+From 9581bca7a8160e2f35c12cbb55f1104a78df63b7 Mon Sep 17 00:00:00 2001
+From: Vishnu Kannaujia <vishnu.kannaujia@gmail.com>
+Date: Thu, 11 Jun 2026 09:02:08 +0000
+Subject: [PATCH] Surface missing backend package in resolve_writer error
+
+When resolve_writer fails to find any available ImageWriter backend, the
+raised OptionalImportError now includes the names of packages that could
+satisfy the requirement, sourced from the _monai_required_pkg attribute
+recorded by the require_pkg decorator. This makes errors like
+'No ImageWriter backend found for png' actionable by suggesting a
+concrete pip install command.
+
+Fixes #7980.
+
+Signed-off-by: Vishnu Kannaujia <vishnu.kannaujia@gmail.com>
+---
+ monai/data/image_writer.py        |  9 +++++-
+ monai/utils/module.py             |  2 ++
+ tests/data/test_resolve_writer.py | 51 +++++++++++++++++++++++++++++++
+ 3 files changed, 61 insertions(+), 1 deletion(-)
+ create mode 100644 tests/data/test_resolve_writer.py
+
+diff --git a/monai/data/image_writer.py b/monai/data/image_writer.py
+index cc6cdcd..5368124 100644
+--- a/monai/data/image_writer.py
++++ b/monai/data/image_writer.py
+@@ -106,17 +106,24 @@ def resolve_writer(ext_name, error_if_not_found=True) -> Sequence:
+     if fmt.startswith("."):
+         fmt = fmt[1:]
+     avail_writers = []
++    missing_pkgs: list[str] = []
+     default_writers = SUPPORTED_WRITERS.get(EXT_WILDCARD, ())
+     for _writer in look_up_option(fmt, SUPPORTED_WRITERS, default=default_writers):
+         try:
+             _writer()  # this triggers `monai.utils.module.require_pkg` to check the system availability
+             avail_writers.append(_writer)
+         except OptionalImportError:
++            pkg = getattr(_writer, "_monai_required_pkg", None)
++            if pkg and pkg not in missing_pkgs:
++                missing_pkgs.append(pkg)
+             continue
+         except Exception:  # other writer init errors indicating it exists
+             avail_writers.append(_writer)
+     if not avail_writers and error_if_not_found:
+-        raise OptionalImportError(f"No ImageWriter backend found for {fmt}.")
++        msg = f"No ImageWriter backend found for {fmt}."
++        if missing_pkgs:
++            msg += f" Please install one of the supported backends: {', '.join(missing_pkgs)} (e.g. `pip install {missing_pkgs[0]}`)."
++        raise OptionalImportError(msg)
+     writer_tuple = ensure_tuple(avail_writers)
+     SUPPORTED_WRITERS[fmt] = writer_tuple
+     return writer_tuple
+diff --git a/monai/utils/module.py b/monai/utils/module.py
+index a2569b1..0d09dc7 100644
+--- a/monai/utils/module.py
++++ b/monai/utils/module.py
+@@ -483,7 +483,9 @@ def require_pkg(
+             return call_obj(*args, **kwargs)
+ 
+         if is_func:
++            _wrapper._monai_required_pkg = pkg_name
+             return _wrapper
++        obj._monai_required_pkg = pkg_name
+         obj.__init__ = _wrapper
+         return obj
+ 
+diff --git a/tests/data/test_resolve_writer.py b/tests/data/test_resolve_writer.py
+new file mode 100644
+index 0000000..475229e
+--- /dev/null
++++ b/tests/data/test_resolve_writer.py
+@@ -0,0 +1,51 @@
++# Copyright (c) MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from __future__ import annotations
++
++import unittest
++
++from monai.data.image_writer import SUPPORTED_WRITERS, register_writer, resolve_writer
++from monai.utils import OptionalImportError
++from monai.utils.module import require_pkg
++
++_TEST_EXT = "monai_testfakeext"
++
++
++@require_pkg(pkg_name="a_definitely_missing_pkg")
++class _FakeWriter:
++    def write(self, *args, **kwargs):
++        pass
++
++
++class TestResolveWriterMissingPkg(unittest.TestCase):
++    def setUp(self):
++        self._original = dict(SUPPORTED_WRITERS)
++        register_writer(_TEST_EXT, _FakeWriter)
++
++    def tearDown(self):
++        SUPPORTED_WRITERS.clear()
++        SUPPORTED_WRITERS.update(self._original)
++
++    def test_error_contains_pkg_name_and_pip_install(self):
++        with self.assertRaises(OptionalImportError) as cm:
++            resolve_writer(f".{_TEST_EXT}")
++        msg = str(cm.exception)
++        self.assertIn("a_definitely_missing_pkg", msg)
++        self.assertIn("pip install", msg)
++
++    def test_no_error_if_not_found_false_returns_empty(self):
++        result = resolve_writer(f".{_TEST_EXT}", error_if_not_found=False)
++        self.assertEqual(result, ())
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
